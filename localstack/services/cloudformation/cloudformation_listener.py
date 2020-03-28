@@ -8,15 +8,18 @@ from requests.models import Request, Response
 from six.moves.urllib import parse as urlparse
 from samtranslator.translator.transform import transform as transform_sam
 from localstack import config
+from localstack.constants import TEST_AWS_ACCOUNT_ID
 from localstack.utils.aws import aws_stack
 from localstack.services.s3 import s3_listener
-from localstack.utils.common import to_str, obj_to_xml, safe_requests, run_safe, timestamp
+from localstack.utils.common import to_str, obj_to_xml, safe_requests, run_safe, timestamp_millis
 from localstack.utils.analytics import event_publisher
 from localstack.utils.cloudformation import template_deployer
 from localstack.services.generic_proxy import ProxyListener
 
 XMLNS_CLOUDFORMATION = 'http://cloudformation.amazonaws.com/doc/2010-05-15/'
 LOG = logging.getLogger(__name__)
+
+MOTO_CLOUDFORMATION_ACCOUNT_ID = '123456789'
 
 
 def error_response(message, code=400, error_type='ValidationError'):
@@ -41,8 +44,8 @@ def make_response(operation_name, content='', code=200):
         {content}
       </{op_name}Result>
       <ResponseMetadata><RequestId>{uid}</RequestId></ResponseMetadata>
-    </{op_name}Response>""".format(xmlns=XMLNS_CLOUDFORMATION,
-        op_name=operation_name, uid=uuid.uuid4(), content=content)
+    </{op_name}Response>""".format(
+        xmlns=XMLNS_CLOUDFORMATION, op_name=operation_name, uid=uuid.uuid4(), content=content)
     response.status_code = code
     return response
 
@@ -89,7 +92,7 @@ def transform_template(req_data):
             os.environ['AWS_DEFAULT_REGION'] = aws_stack.get_region()
         try:
             transformed = transform_sam(parsed, {}, MockPolicyLoader())
-            return transformed
+            return json.dumps(transformed)
         finally:
             os.environ.pop('AWS_DEFAULT_REGION', None)
             if region_before is not None:
@@ -112,6 +115,7 @@ def get_template_body(req_data):
                 parsed_path = urlparse.urlparse(url).path.lstrip('/')
                 parts = parsed_path.partition('/')
                 client = aws_stack.connect_to_service('s3')
+                LOG.debug('Download CloudFormation template content from local S3: %s - %s' % (parts[0], parts[2]))
                 result = client.get_object(Bucket=parts[0], Key=parts[2])
                 body = to_str(result['Body'].read())
                 return body
@@ -121,7 +125,8 @@ def get_template_body(req_data):
 
 
 def is_local_service_url(url):
-    return '://%s:' % config.LOCALSTACK_HOSTNAME in url
+    candidates = ('localhost', config.LOCALSTACK_HOSTNAME, config.HOSTNAME_EXTERNAL, config.HOSTNAME)
+    return url and any('://%s:' % host in url for host in candidates)
 
 
 def is_real_s3_url(url):
@@ -141,28 +146,46 @@ def convert_s3_to_local_url(url):
 
 
 def fix_hardcoded_creation_date(response):
-    search = '<CreationTime>2011-05-23T15:47:44Z</CreationTime>'
-    replace = '<CreationTime>%s</CreationTime>' % timestamp()
-    response._content = to_str(response._content or '').replace(search, replace)
+    # TODO: remove once this is fixed upstream
+    search = r'<CreationTime>\s*(2011-05-23T15:47:44Z)?\s*</CreationTime>'
+    replace = r'<CreationTime>%s</CreationTime>' % timestamp_millis()
+    fix_in_response(search, replace, response)
+
+
+def fix_region_in_arns(response):
+    search = r'arn:aws:cloudformation:[^:]+:'
+    replace = r'arn:aws:cloudformation:%s:' % aws_stack.get_region()
+    fix_in_response(search, replace, response)
+
+
+def fix_in_response(search, replace, response):
+    response._content = re.sub(search, replace, to_str(response._content or ''))
     response.headers['Content-Length'] = str(len(response._content))
 
 
 class ProxyListenerCloudFormation(ProxyListener):
-
     def forward_request(self, method, path, data, headers):
         if method == 'OPTIONS':
             return 200
 
+        data = data or ''
+        data_orig = data
+        data = aws_stack.fix_account_id_in_arns(data, existing=TEST_AWS_ACCOUNT_ID,
+            replace=MOTO_CLOUDFORMATION_ACCOUNT_ID, colon_delimiter='%3A')
+
         req_data = None
         if method == 'POST' and path == '/':
+
             req_data = urlparse.parse_qs(to_str(data))
             req_data = dict([(k, v[0]) for k, v in req_data.items()])
             action = req_data.get('Action')
             stack_name = req_data.get('StackName')
 
             if action == 'CreateStack':
-                event_publisher.fire_event(event_publisher.EVENT_CLOUDFORMATION_CREATE_STACK,
-                    payload={'n': event_publisher.get_hash(stack_name)})
+                event_publisher.fire_event(
+                    event_publisher.EVENT_CLOUDFORMATION_CREATE_STACK,
+                    payload={'n': event_publisher.get_hash(stack_name)}
+                )
 
             if action == 'DeleteStack':
                 client = aws_stack.connect_to_service('cloudformation')
@@ -175,8 +198,8 @@ class ProxyListenerCloudFormation(ProxyListener):
                 if stack_name:
                     if stack_name.startswith('arn:aws:cloudformation'):
                         run_fix = True
-                        stack_name = re.sub(r'arn:aws:cloudformation:[^:]+:[^:]+:stack/([^/]+)(/.+)?',
-                                            r'\1', stack_name)
+                        pattern = r'arn:aws:cloudformation:[^:]+:[^:]+:stack/([^/]+)(/.+)?'
+                        stack_name = re.sub(pattern, r'\1', stack_name)
                 if run_fix:
                     stack_names = [stack_name] if stack_name else self._list_stack_names()
                     client = aws_stack.connect_to_service('cloudformation')
@@ -191,17 +214,25 @@ class ProxyListenerCloudFormation(ProxyListener):
         if req_data:
             if action == 'ValidateTemplate':
                 return validate_template(req_data)
+
             if action in ['CreateStack', 'UpdateStack']:
                 do_replace_url = is_real_s3_url(req_data.get('TemplateURL'))
                 if do_replace_url:
                     req_data['TemplateURL'] = convert_s3_to_local_url(req_data['TemplateURL'])
-                modified_request = transform_template(req_data)
-                if modified_request:
+                url = req_data.get('TemplateURL', '')
+                is_custom_local_endpoint = is_local_service_url(url) and '://localhost:' not in url
+                modified_template_body = transform_template(req_data)
+                if not modified_template_body and is_custom_local_endpoint:
+                    modified_template_body = get_template_body(req_data)
+                if modified_template_body:
                     req_data.pop('TemplateURL', None)
-                    req_data['TemplateBody'] = json.dumps(modified_request)
-                if modified_request or do_replace_url:
+                    req_data['TemplateBody'] = modified_template_body
+                if modified_template_body or do_replace_url:
                     data = urlparse.urlencode(req_data, doseq=True)
                     return Request(data=data, headers=headers, method=method)
+
+            if data != data_orig or action in ['DescribeChangeSet', 'ExecuteChangeSet']:
+                return Request(data=urlparse.urlencode(req_data, doseq=True), headers=headers, method=method)
 
         return True
 
@@ -217,8 +248,10 @@ class ProxyListenerCloudFormation(ProxyListener):
         if response._content:
             aws_stack.fix_account_id_in_arns(response)
             fix_hardcoded_creation_date(response)
+            fix_region_in_arns(response)
 
-    def _list_stack_names(self):
+    @staticmethod
+    def _list_stack_names():
         client = aws_stack.connect_to_service('cloudformation')
         stacks = client.list_stacks()['StackSummaries']
         stack_names = []
