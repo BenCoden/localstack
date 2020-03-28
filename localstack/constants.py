@@ -2,7 +2,7 @@ import os
 import localstack_client.config
 
 # LocalStack version
-VERSION = '0.10.8'
+VERSION = '0.10.9'
 
 # constant to represent the "local" region, i.e., local machine
 REGION_LOCAL = 'local'
@@ -25,8 +25,6 @@ DEFAULT_PORT_EC2_BACKEND = 4556
 DEFAULT_PORT_KMS_BACKEND = 4555
 DEFAULT_PORT_EVENTS_BACKEND = 4554
 DEFAULT_PORT_LOGS_BACKEND = 4553
-DEFAULT_PORT_SECRETSMANAGER_BACKEND = 4552
-DEFAULT_PORT_SES_BACKEND = 4551
 
 DEFAULT_PORT_WEB_UI = 8080
 
@@ -82,7 +80,7 @@ FALSE_STRINGS = ('0', 'false', 'False')
 LAMBDA_TEST_ROLE = 'arn:aws:iam::%s:role/lambda-test-role' % TEST_AWS_ACCOUNT_ID
 
 # installation constants
-ELASTICSEARCH_JAR_URL = 'https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-6.7.0.zip'
+ELASTICSEARCH_JAR_URL = 'https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-7.1.0-linux-x86_64.tar.gz'
 # See https://docs.aws.amazon.com/ja_jp/elasticsearch-service/latest/developerguide/aes-supported-plugins.html
 ELASTICSEARCH_PLUGIN_LIST = ['analysis-icu', 'ingest-attachment', 'analysis-kuromoji',
  'mapper-murmur3', 'mapper-size', 'analysis-phonetic', 'analysis-smartcn', 'analysis-stempel', 'analysis-ukrainian']
